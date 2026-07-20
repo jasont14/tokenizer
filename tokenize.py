@@ -70,6 +70,7 @@ class Tokenizer:
         return None
 
     def _get_string(self):
+        """Consume a single-quoted string constant."""
         quote = self._current()
         start = self.pos
         self._advance()
@@ -85,6 +86,33 @@ class Tokenizer:
             self._advance()
         return Token(CONSTANT, self.text[start:self.pos])
 
+    def _get_quoted_identifier(self):
+        """
+        Consume a double-quoted identifier: "schema"."table" style.
+        Reads one quoted segment at a time; the dot between segments
+        is emitted as a SPECIAL token by the main tokenize() loop.
+        """
+        start = self.pos
+        self._advance()  # consume opening "
+        while self._current() is not None:
+            if self._current() == '"':
+                # Handle escaped double-quote ("") inside identifier
+                if self.pos + 1 < len(self.text) and self.text[self.pos + 1] == '"':
+                    self._advance()  # skip first "
+                    self._advance()  # skip second "
+                    continue
+                self._advance()  # consume closing "
+                break
+            self._advance()
+        raw = self.text[start:self.pos]
+        # Strip the surrounding quotes for classification
+        value = raw[1:-1].lower() if len(raw) >= 2 else raw.lower()
+        if value in TABLE_KOI:
+            return Token(KOI, value)
+        elif value in SQL_KEYWORDS:
+            return Token(KEYWORD, value)
+        return Token(IDENTIFIER, value)
+
     def _get_number(self):
         start = self.pos
         while self._current() is not None and (self._current().isdigit() or self._current() in {'.', 'e', 'E', '+', '-'}):
@@ -92,8 +120,9 @@ class Tokenizer:
         return Token(CONSTANT, self.text[start:self.pos])
 
     def _get_identifier(self):
+        """Consume an unquoted identifier or keyword."""
         start = self.pos
-        while self._current() is not None and (self._current().isalnum() or self._current() in {'_', '"', '$'}):
+        while self._current() is not None and (self._current().isalnum() or self._current() in {'_', '$'}):
             self._advance()
         value = self.text[start:self.pos].lower()
         if value in TABLE_KOI:
@@ -117,13 +146,17 @@ class Tokenizer:
             if comment := self._skip_comment():
                 self.tokens.append(comment)
                 continue
-            if char in {"'", '"'}:
+            if char == "'":
                 self.tokens.append(self._get_string())
+                continue
+            if char == '"':
+                # Double-quote always starts a quoted identifier in PostgreSQL
+                self.tokens.append(self._get_quoted_identifier())
                 continue
             if char.isdigit() or (char == '.' and self.pos + 1 < len(self.text) and self.text[self.pos + 1].isdigit()):
                 self.tokens.append(self._get_number())
                 continue
-            if char.isalpha() or char in {'_', '"', '$'}:
+            if char.isalpha() or char in {'_', '$'}:
                 self.tokens.append(self._get_identifier())
                 continue
             if char in SPEC_CHARS:
@@ -142,43 +175,105 @@ class Tokenizer:
 class TableExtractor:
     def __init__(self, tokens: List[Token]):
         self.tokens = tokens
-        self.tables = []
+        self.tables: List[Tuple[str, str]] = []
 
     def extract_tables(self) -> List[Tuple[str, str]]:
         i = 0
         while i < len(self.tokens):
             tok = self.tokens[i]
             if tok.type == KOI and tok.value in TABLE_KOI:
+                # Advance past the KOI token, then parse the table context.
+                # _parse_table_context returns the index where it stopped so
+                # the outer loop resumes correctly after the parsed clause —
+                # previously the return value was ignored, causing i to never
+                # advance past multi-table clauses (e.g. FROM a, b, c).
+                i = self._parse_table_context(i + 1)
+            else:
                 i += 1
-                self._parse_table_context(i)
-                while i < len(self.tokens) and self.tokens[i].type not in {KEYWORD, KOI, SPECIAL, EOF}:
-                    i += 1
-                continue
-            i += 1
         return self.tables
 
-    def _parse_table_context(self, i: int):
+    def _parse_table_context(self, i: int) -> int:
+        """
+        Parse one or more table references after a KOI token.
+        Returns the index of the first token that belongs to the next clause,
+        so the caller can resume the outer scan from there.
+        """
         while i < len(self.tokens):
             tok = self.tokens[i]
-            if tok.type in {KEYWORD, KOI, SPECIAL, EOF} and tok.value not in {'as', '.'}:
-                if tok.value in {'on', 'where', 'group', 'order', 'having'}:
-                    break
-                if tok.value == ',':
+
+            # Bail out on clause-ending keywords/tokens
+            if tok.type == EOF:
+                break
+            if tok.type == KOI:
+                break
+            if tok.type == KEYWORD and tok.value in {
+                'on', 'where', 'group', 'order', 'having', 'set',
+                'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter'
+            }:
+                break
+            if tok.type == SPECIAL and tok.value in {'(', ')', ';'}:
+                # Skip subquery open-paren; stop on close-paren or statement end
+                if tok.value == '(':
                     i += 1
                     continue
                 break
+
+            # Comma separating multiple tables — skip and keep parsing
+            if tok.type == SPECIAL and tok.value == ',':
+                i += 1
+                continue
+
+            # Dot for schema-qualified names: consume schema.table as one identifier
+            if tok.type == SPECIAL and tok.value == '.':
+                # The previous table entry already has the schema part; replace
+                # it with the fully qualified name, then consume any alias on
+                # the same pass so it is not mistaken for a new table reference.
+                i += 1
+                if i < len(self.tokens) and self.tokens[i].type == IDENTIFIER:
+                    if self.tables:
+                        schema, old_alias = self.tables[-1]
+                        fq_name = f"{schema}.{self.tokens[i].value}"
+                        i += 1
+                        alias = ''
+                        # Optional AS keyword
+                        if (i < len(self.tokens)
+                                and self.tokens[i].type == KEYWORD
+                                and self.tokens[i].value == 'as'):
+                            i += 1
+                        # Alias identifier
+                        if (i < len(self.tokens)
+                                and self.tokens[i].type == IDENTIFIER
+                                and self.tokens[i].value not in SQL_KEYWORDS
+                                and self.tokens[i].value not in TABLE_KOI):
+                            alias = self.tokens[i].value
+                            i += 1
+                        self.tables[-1] = (fq_name, alias)
+                continue
+
             if tok.type in {IDENTIFIER, CONSTANT}:
                 table = tok.value.lower()
                 alias = ''
                 i += 1
-                if i < len(self.tokens) and self.tokens[i].value.lower() == 'as':
+
+                # Optional AS keyword
+                if i < len(self.tokens) and self.tokens[i].type == KEYWORD and self.tokens[i].value == 'as':
                     i += 1
-                if i < len(self.tokens) and self.tokens[i].type == IDENTIFIER:
+
+                # Alias: next token is an identifier that is not a keyword/KOI
+                if (i < len(self.tokens)
+                        and self.tokens[i].type == IDENTIFIER
+                        and self.tokens[i].value not in SQL_KEYWORDS
+                        and self.tokens[i].value not in TABLE_KOI):
                     alias = self.tokens[i].value
                     i += 1
+
                 self.tables.append((table, alias))
                 continue
+
+            # Anything else (operators, etc.) — step over it
             i += 1
+
+        return i
 
 
 def get_sql_files(path: str) -> List[Tuple[str, str]]:
