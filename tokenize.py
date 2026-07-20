@@ -10,7 +10,7 @@ import sys
 import argparse
 import json
 import csv
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 from pathlib import Path
 
 # Token types
@@ -151,7 +151,6 @@ class TableExtractor:
             if tok.type == KOI and tok.value in TABLE_KOI:
                 i += 1
                 self._parse_table_context(i)
-                # Skip to next potential clause
                 while i < len(self.tokens) and self.tokens[i].type not in {KEYWORD, KOI, SPECIAL, EOF}:
                     i += 1
                 continue
@@ -169,7 +168,7 @@ class TableExtractor:
                     continue
                 break
             if tok.type in {IDENTIFIER, CONSTANT}:
-                table = tok.value.lower()  # Normalize for matching
+                table = tok.value.lower()
                 alias = ''
                 i += 1
                 if i < len(self.tokens) and self.tokens[i].value.lower() == 'as':
@@ -178,12 +177,11 @@ class TableExtractor:
                     alias = self.tokens[i].value
                     i += 1
                 self.tables.append((table, alias))
-                continue  # Continue parsing after table
+                continue
             i += 1
 
 
 def get_sql_files(path: str) -> List[Tuple[str, str]]:
-    """Recursively find .sql files or return single file."""
     path_obj = Path(path)
     files = []
     if path_obj.is_file():
@@ -211,7 +209,7 @@ def main():
     parser.add_argument("path", nargs="?", help="File, folder, or omitted with --text")
     parser.add_argument("-t", "--text", help="Direct SQL text")
     parser.add_argument("--tokens", action="store_true", help="Print all tokens")
-    parser.add_argument("--tables", action="store_true", help="Print extracted tables")
+    parser.add_argument("--tables", action="store_true", help="Print extracted tables (default when --search used)")
     parser.add_argument("--search", help="Filter to files referencing this table name (case-insensitive)")
     parser.add_argument("--format", choices=["text", "json", "csv"], default="text",
                         help="Output format (default: text)")
@@ -223,7 +221,6 @@ def main():
         print("Error: Provide path or --text", file=sys.stderr)
         sys.exit(1)
 
-    # Collect texts
     texts = []
     if args.text:
         texts.append(("input", args.text))
@@ -236,6 +233,8 @@ def main():
     results = []
     search_term = args.search.lower() if args.search else None
     match_count = 0
+
+    show_tables = args.tables or bool(args.search) or bool(args.text)
 
     for name, sql in texts:
         tokenizer = Tokenizer(sql)
@@ -263,26 +262,20 @@ def main():
                 for t in tokens:
                     if t.type != EOF:
                         print(t)
-            if args.tables or args.search:
+            if show_tables:
                 print("Tables found:")
                 for table, alias in tables:
                     print(f"  {table}" + (f" AS {alias}" if alias else ""))
 
-    # Summary
     if args.format == "text":
         if args.search:
             print(f"\nFound in {match_count} files")
         else:
             print(f"\nProcessed {len(results)} files")
 
-    # Output JSON/CSV
     if args.format in {"json", "csv"} or args.output:
         output_data = results
-        if args.output:
-            out_path = args.output
-        else:
-            out_path = f"table_results.{args.format}"
-
+        out_path = args.output or f"table_results.{args.format}"
         try:
             if args.format == "json":
                 with open(out_path, 'w', encoding='utf-8') as f:
