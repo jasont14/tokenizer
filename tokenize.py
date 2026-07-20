@@ -2,12 +2,16 @@
 """
 Simple SQL Tokenizer and Table Extractor for PostgreSQL.
 Hand-rolled lexer (no regex).
+Updated with --search TABLE_NAME, summary, JSON/CSV output, directory support, and robustness fixes.
 """
 
 import os
 import sys
 import argparse
-from typing import List, Tuple
+import json
+import csv
+from typing import List, Tuple, Dict
+from pathlib import Path
 
 # Token types
 KEYWORD = 'KEYWORD'
@@ -27,7 +31,6 @@ SQL_KEYWORDS = {
     'left', 'right', 'inner', 'outer', 'full', 'cross', 'natural',
     'as', 'values', 'set', 'and', 'or', 'not', 'is', 'null'
 }
-
 SPEC_CHARS = {'(', ')', ',', ';', '.', '[', ']', '{', '}', '$', ':'}
 OPERATORS = {'+', '-', '*', '/', '=', '<', '>', '!', '~', '@', '%', '^', '&', '|', '`', '?', '::'}
 WHITESPACE = {' ', '\t', '\n', '\r'}
@@ -76,6 +79,9 @@ class Tokenizer:
                 break
             if self._current() == '\\':
                 self._advance()
+                if self._current() is not None:
+                    self._advance()
+                continue
             self._advance()
         return Token(CONSTANT, self.text[start:self.pos])
 
@@ -108,7 +114,6 @@ class Tokenizer:
             if self.pos >= len(self.text):
                 break
             char = self._current()
-
             if comment := self._skip_comment():
                 self.tokens.append(comment)
                 continue
@@ -128,10 +133,8 @@ class Tokenizer:
             if char in ''.join(OPERATORS) or char in {'<', '>', '=', '!'}:
                 self.tokens.append(self._get_operator())
                 continue
-
             self.tokens.append(Token(UNKNOWN, char))
             self._advance()
-
         self.tokens.append(Token(EOF, ''))
         return self.tokens
 
@@ -148,6 +151,7 @@ class TableExtractor:
             if tok.type == KOI and tok.value in TABLE_KOI:
                 i += 1
                 self._parse_table_context(i)
+                # Skip to next potential clause
                 while i < len(self.tokens) and self.tokens[i].type not in {KEYWORD, KOI, SPECIAL, EOF}:
                     i += 1
                 continue
@@ -158,61 +162,141 @@ class TableExtractor:
         while i < len(self.tokens):
             tok = self.tokens[i]
             if tok.type in {KEYWORD, KOI, SPECIAL, EOF} and tok.value not in {'as', '.'}:
-                if tok.value in {'on', 'where', 'group', 'order'}:
+                if tok.value in {'on', 'where', 'group', 'order', 'having'}:
                     break
                 if tok.value == ',':
                     i += 1
                     continue
                 break
-
             if tok.type in {IDENTIFIER, CONSTANT}:
-                table = tok.value
+                table = tok.value.lower()  # Normalize for matching
                 alias = ''
                 i += 1
-                if i < len(self.tokens) and self.tokens[i].value == 'as':
+                if i < len(self.tokens) and self.tokens[i].value.lower() == 'as':
                     i += 1
                 if i < len(self.tokens) and self.tokens[i].type == IDENTIFIER:
                     alias = self.tokens[i].value
                     i += 1
                 self.tables.append((table, alias))
-            else:
-                i += 1
+                continue  # Continue parsing after table
+            i += 1
+
+
+def get_sql_files(path: str) -> List[Tuple[str, str]]:
+    """Recursively find .sql files or return single file."""
+    path_obj = Path(path)
+    files = []
+    if path_obj.is_file():
+        if path_obj.suffix.lower() in {'.sql', '.txt'}:
+            try:
+                with open(path_obj, encoding='utf-8', errors='ignore') as f:
+                    files.append((str(path_obj), f.read()))
+            except Exception as e:
+                print(f"Warning: Could not read {path_obj}: {e}", file=sys.stderr)
+    elif path_obj.is_dir():
+        for root, _, filenames in os.walk(path_obj):
+            for filename in filenames:
+                if Path(filename).suffix.lower() in {'.sql', '.txt'}:
+                    filepath = Path(root) / filename
+                    try:
+                        with open(filepath, encoding='utf-8', errors='ignore') as f:
+                            files.append((str(filepath), f.read()))
+                    except Exception as e:
+                        print(f"Warning: Could not read {filepath}: {e}", file=sys.stderr)
+    return files
 
 
 def main():
     parser = argparse.ArgumentParser(description="SQL Tokenizer and Table Extractor")
-    parser.add_argument("path", nargs="?", help="File or folder")
+    parser.add_argument("path", nargs="?", help="File, folder, or omitted with --text")
     parser.add_argument("-t", "--text", help="Direct SQL text")
-    parser.add_argument("--tokens", action="store_true")
-    parser.add_argument("--tables", action="store_true")
+    parser.add_argument("--tokens", action="store_true", help="Print all tokens")
+    parser.add_argument("--tables", action="store_true", help="Print extracted tables")
+    parser.add_argument("--search", help="Filter to files referencing this table name (case-insensitive)")
+    parser.add_argument("--format", choices=["text", "json", "csv"], default="text",
+                        help="Output format (default: text)")
+    parser.add_argument("--output", help="Output file for JSON/CSV (optional)")
+
     args = parser.parse_args()
 
     if not args.path and not args.text:
         print("Error: Provide path or --text", file=sys.stderr)
         sys.exit(1)
 
+    # Collect texts
     texts = []
     if args.text:
         texts.append(("input", args.text))
-    elif os.path.isfile(args.path or ""):
-        with open(args.path, encoding='utf-8') as f:
-            texts.append((args.path, f.read()))
+    elif args.path:
+        texts = get_sql_files(args.path)
+        if not texts:
+            print(f"Error: No SQL files found in {args.path}", file=sys.stderr)
+            sys.exit(1)
+
+    results = []
+    search_term = args.search.lower() if args.search else None
+    match_count = 0
 
     for name, sql in texts:
-        print(f"\n=== {name} ===")
         tokenizer = Tokenizer(sql)
         tokens = tokenizer.tokenize()
-
-        if args.tokens:
-            for t in tokens:
-                if t.type != EOF:
-                    print(t)
-
         extractor = TableExtractor(tokens)
         tables = extractor.extract_tables()
-        print("Tables found:")
-        for table, alias in tables:
-            print(f"  {table}" + (f" AS {alias}" if alias else ""))
+
+        table_names = {table for table, _ in tables}
+
+        if search_term and search_term not in table_names:
+            continue
+
+        if args.search:
+            match_count += 1
+
+        file_result = {
+            "file": name,
+            "tables": [{"table": t, "alias": a} for t, a in tables]
+        }
+        results.append(file_result)
+
+        if args.format == "text":
+            print(f"\n=== {name} ===")
+            if args.tokens:
+                for t in tokens:
+                    if t.type != EOF:
+                        print(t)
+            if args.tables or args.search:
+                print("Tables found:")
+                for table, alias in tables:
+                    print(f"  {table}" + (f" AS {alias}" if alias else ""))
+
+    # Summary
+    if args.format == "text":
+        if args.search:
+            print(f"\nFound in {match_count} files")
+        else:
+            print(f"\nProcessed {len(results)} files")
+
+    # Output JSON/CSV
+    if args.format in {"json", "csv"} or args.output:
+        output_data = results
+        if args.output:
+            out_path = args.output
+        else:
+            out_path = f"table_results.{args.format}"
+
+        try:
+            if args.format == "json":
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    json.dump(output_data, f, indent=2)
+            elif args.format == "csv":
+                with open(out_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["file", "table", "alias"])
+                    for res in output_data:
+                        for t in res["tables"]:
+                            writer.writerow([res["file"], t["table"], t["alias"]])
+            print(f"Results saved to {out_path}")
+        except Exception as e:
+            print(f"Error writing output: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
